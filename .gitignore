@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.idea/
+.pytest_cache/
+minio_data/
+.env
+notebooks/.ipynb_checkpoints/
+generator/data/raw/
+.DS_Store
