@@ -80,7 +80,9 @@ services:
     build: .
     container_name: jupyter
     ports:
-      - "8889:8888"
+      # Loopback-only: Jupyter runs with no token/password (see jupyter/*.py),
+      # so this must not be reachable from other hosts on the network.
+      - "127.0.0.1:8889:8888"
     volumes:
       - ./notebooks:/opt/notebooks
     environment:

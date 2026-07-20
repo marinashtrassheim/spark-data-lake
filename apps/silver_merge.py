@@ -81,14 +81,25 @@ if not error_df.rdd.isEmpty():
 
 # CDC event types from the source system.
 inserts_raw_df = valid_df.filter(col("operation") == "INSERT")
-updates_df = valid_df.filter(col("operation") == "UPDATE")
+updates_raw_df = valid_df.filter(col("operation") == "UPDATE")
 
-# One INSERT per subscription per batch (latest event wins).
+# One INSERT / one UPDATE per subscription per batch (latest event wins).
+# Without this on the UPDATE side, two UPDATEs for the same subscription in
+# one batch would both pass the "differs from current" filter below and each
+# get written as is_current=True, violating the SCD2 invariant checked at
+# the end of this script.
 insert_rank = Window.partitionBy("subscription_id").orderBy(col("event_ts").desc())
 inserts_df = (
     inserts_raw_df.withColumn("_insert_rn", row_number().over(insert_rank))
     .filter(col("_insert_rn") == 1)
     .drop("_insert_rn")
+)
+
+update_rank = Window.partitionBy("subscription_id").orderBy(col("event_ts").desc())
+updates_df = (
+    updates_raw_df.withColumn("_update_rn", row_number().over(update_rank))
+    .filter(col("_update_rn") == 1)
+    .drop("_update_rn")
 )
 
 try:
@@ -197,26 +208,36 @@ if silver_exists:
             .save(SILVER_PATH)
 
 else:
-    logger.info("Silver not found; running initial INSERT bootstrap")
-    # First load: one current row per subscription (deduped in inserts_df above).
-    silver_initial = inserts_df.select(
-        col("subscription_id"),
-        col("user_id"),
-        col("plan_type"),
-        col("price"),
-        col("billing_cycle"),
-        col("status"),
-        col("auto_renew"),
-        col("start_date"),
-        col("cancel_date"),
-        col("operation"),
-        col("event_ts").alias("timestamp"),
-        col("event_ts").alias("valid_from"),
-        lit(None).cast(TimestampType()).alias("valid_to"),
-        lit(True).alias("is_current"),
-        col("ingest_timestamp"),
-        col("source_file"),
-        col("dt")
+    logger.info("Silver not found; running initial INSERT+UPDATE bootstrap")
+    # First load: no prior Silver state to diff UPDATEs against, so full SCD2
+    # history can't be reconstructed retroactively. Instead, take the latest
+    # valid event per subscription — INSERT or UPDATE — as its current row.
+    # (Using inserts_df alone here would silently drop every subscription
+    # whose only events in this initial batch are UPDATEs.)
+    bootstrap_rank = Window.partitionBy("subscription_id").orderBy(col("event_ts").desc())
+    silver_initial = (
+        valid_df.withColumn("_rn", row_number().over(bootstrap_rank))
+        .filter(col("_rn") == 1)
+        .drop("_rn")
+        .select(
+            col("subscription_id"),
+            col("user_id"),
+            col("plan_type"),
+            col("price"),
+            col("billing_cycle"),
+            col("status"),
+            col("auto_renew"),
+            col("start_date"),
+            col("cancel_date"),
+            col("operation"),
+            col("event_ts").alias("timestamp"),
+            col("event_ts").alias("valid_from"),
+            lit(None).cast(TimestampType()).alias("valid_to"),
+            lit(True).alias("is_current"),
+            col("ingest_timestamp"),
+            col("source_file"),
+            col("dt")
+        )
     )
 
     silver_initial.write \
