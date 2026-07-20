@@ -141,6 +141,16 @@ try:
 except Exception:
     logger.info("Bronze table not found yet; skipping cross-run anti-join")
 
+# Materialize once: bronze_df's lineage reads BRONZE_PATH (the anti-join above).
+# Caching alone isn't reliably enough to stop Delta re-listing that source at
+# execution time, so both written_count and max_event_ts are computed here,
+# *before* the Bronze write below. Computing max_event_ts after the write (as
+# this used to do) re-evaluates bronze_df's lineage against the now-mutated
+# BRONZE_PATH: the anti-join sees the rows this run just appended as "already
+# existing", filters bronze_df down to empty, and spark_max(...) returns None
+# — which crashes spark.createDataFrame() on type inference.
+bronze_df = bronze_df.cache()
+
 written_count = bronze_df.count()
 logger.info(
     "Bronze counters | raw=%s valid=%s corrupt=%s written=%s",
@@ -155,6 +165,8 @@ if written_count == 0:
     spark.stop()
     sys.exit(0)
 
+max_event_ts = bronze_df.agg(spark_max("event_ts")).collect()[0][0]
+
 # Partition by event date for prune-friendly downstream reads.
 bronze_df.write \
     .format("delta") \
@@ -163,8 +175,9 @@ bronze_df.write \
     .partitionBy("dt") \
     .save(BRONZE_PATH)
 
+bronze_df.unpersist()
+
 # Advance checkpoint only after a successful Bronze append.
-max_event_ts = bronze_df.agg(spark_max("event_ts")).collect()[0][0]
 checkpoint_data = spark.createDataFrame([(max_event_ts,)], ["last_processed_event_ts"])
 checkpoint_data.write \
     .format("delta") \

@@ -8,6 +8,7 @@ from pyspark.sql.functions import col, to_timestamp, lit, max as spark_max, row_
 from pyspark.sql.types import TimestampType
 from pyspark.sql.window import Window
 from pyspark.sql.utils import AnalysisException
+from delta.tables import DeltaTable
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -128,25 +129,20 @@ if silver_exists:
     ) \
         .select(col("upd.*"))
 
-    if not updates_with_changes.rdd.isEmpty():
-        # Close open version at UPDATE event time, then append the new current row.
+    # Pin this result before touching SILVER_PATH below. updates_with_changes'
+    # row set depends on silver_active (read from SILVER_PATH); without a full
+    # materialization here, close_events/new_versions_df could be lazily
+    # re-evaluated *after* the merge below closes rows, see silver_active as
+    # no-longer-current for those subscriptions, and silently produce zero
+    # new-version rows for exactly the subscriptions just closed. Using
+    # .count() (not .isEmpty(), which can short-circuit after one partition)
+    # forces the whole cached result to materialize now.
+    updates_with_changes = updates_with_changes.cache()
+    changed_count = updates_with_changes.count()
+
+    if changed_count > 0:
         close_events = updates_with_changes.groupBy("subscription_id") \
             .agg(spark_max("event_ts").alias("close_valid_to"))
-
-        closed_versions = silver_current \
-            .filter(col("is_current") == True) \
-            .join(close_events, "subscription_id", "inner") \
-            .withColumn("valid_to", col("close_valid_to")) \
-            .withColumn("is_current", lit(False))
-
-        # NOTE for portfolio: append-based SCD2 closure is kept for demo simplicity.
-        # In production, prefer atomic Delta MERGE/UPDATE and document this trade-off in README.
-        closed_versions.write \
-            .format("delta") \
-            .mode("append") \
-            .option("mergeSchema", "true") \
-            .partitionBy("plan_type") \
-            .save(SILVER_PATH)
 
         new_versions_df = updates_with_changes.select(
             col("subscription_id"),
@@ -168,12 +164,34 @@ if silver_exists:
             col("dt")
         )
 
+        # Close in place with a Delta MERGE, not an append of a modified copy.
+        # An append-based "close" (writing a new row with is_current=False)
+        # does not touch the original row — it stays is_current=True forever,
+        # so the subscription ends up with two "current" rows (the untouched
+        # original plus the new version below), which trips the SCD2
+        # invariant check at the end of this script.
+        silver_table = DeltaTable.forPath(spark, SILVER_PATH)
+        (
+            silver_table.alias("tgt")
+            .merge(
+                close_events.alias("src"),
+                "tgt.subscription_id = src.subscription_id AND tgt.is_current = true",
+            )
+            .whenMatchedUpdate(set={
+                "valid_to": col("src.close_valid_to"),
+                "is_current": lit(False),
+            })
+            .execute()
+        )
+
         new_versions_df.write \
             .format("delta") \
             .mode("append") \
             .option("mergeSchema", "true") \
             .partitionBy("plan_type") \
             .save(SILVER_PATH)
+
+        updates_with_changes.unpersist()
 
     # INSERT only for subscriptions not yet present in Silver (left_anti).
     existing_ids = silver_current.select("subscription_id").distinct()
